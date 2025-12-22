@@ -1,0 +1,317 @@
+#include <SoftwareSerial.h>
+#include <LiquidCrystal.h>
+
+/*
+ LiDAR Parktronic Prototype
+ Author: Tigran Babayan
+
+ Description:
+ LiDAR-based proximity sensing system with state-driven behavior.
+ Distance is measured using a LiDAR sensor and translated into
+ visual (LED), audio (buzzer), and textual (LCD) feedback.
+
+ This code focuses on system behavior and robustness,
+ not on final product optimization.
+*/
+
+/* ================= TF-LUNA ================= */
+SoftwareSerial lidar(2, 3); // RX, TX (Arduino RX=D2 from LiDAR TX)
+
+uint8_t frame[9];
+uint8_t fidx = 0;
+int distanceRaw = 9999;
+unsigned long lastGoodReadMs = 0;
+
+/* ================= LED PINS ================= */
+const int PIN_GREEN  = 4;
+const int PIN_Y1     = 5;
+const int PIN_Y2     = 6;
+const int PIN_Y3     = 7;
+const int PIN_RED    = 8;
+
+/* ================= BUZZER ================= */
+const int PIN_BUZZER = 9; // passive buzzer
+
+/* ================= LCD ================= */
+/* RS=D10, E=D11, D4=D12, D5=D13, D6=A0, D7=A1 */
+LiquidCrystal lcd(10, 11, 12, 13, A0, A1);
+
+/* ================= SMOOTHING ================= */
+const int N = 5;
+int dBuf[N];
+int dPos = 0;
+bool dFilled = false;
+
+int smoothDistance(int v) {
+  dBuf[dPos++] = v;
+  if (dPos >= N) { dPos = 0; dFilled = true; }
+
+  int cnt = dFilled ? N : dPos;
+  long sum = 0;
+  for (int i = 0; i < cnt; i++) sum += dBuf[i];
+  return (cnt > 0) ? (int)(sum / cnt) : v;
+}
+
+/* ================= ZONES + HYSTERESIS ================= */
+int zone = 0;
+const int HYS = 5;
+
+const int T1 = 50;
+const int T2 = 30;
+const int T3 = 20;
+const int T4 = 10;
+
+int updateZone(int z, int d) {
+  switch (z) {
+    case 0: if (d <= T1 - HYS) return 1; return 0;
+    case 1:
+      if (d >= T1 + HYS) return 0;
+      if (d <= T2 - HYS) return 2;
+      return 1;
+    case 2:
+      if (d >= T2 + HYS) return 1;
+      if (d <= T3 - HYS) return 3;
+      return 2;
+    case 3:
+      if (d >= T3 + HYS) return 2;
+      if (d <= T4 - HYS) return 4;
+      return 3;
+    case 4:
+      if (d >= T4 + HYS) return 3;
+      return 4;
+  }
+  return 0;
+}
+
+/* ================= LCD UI (clean, 16 chars safe) ================= */
+void lcdClearLine(int line) {
+  lcd.setCursor(0, line);
+  lcd.print("                "); // 16 spaces
+}
+
+void lcdPrintDistance(int d) {
+  lcdClearLine(0);
+  lcd.setCursor(0, 0);
+  lcd.print("DIST: ");
+  if (d < 100) lcd.print('0');
+  if (d < 10)  lcd.print('0');
+  lcd.print(d);
+  lcd.print(" cm");
+}
+
+void lcdPrintStatus(int z, bool stopBlinkOn) {
+  lcdClearLine(1);
+  lcd.setCursor(0, 1);
+
+  // Keep all strings <= 16 chars
+  switch (z) {
+    case 0: lcd.print("STATUS: SAFE"); break;
+    case 1: lcd.print("STATUS: CAUTION"); break;
+    case 2: lcd.print("STATUS: CLOSE"); break;
+    case 3: lcd.print("STATUS: V.CLOSE"); break;
+    case 4:
+      // blink STOP text
+      if (stopBlinkOn) lcd.print("!!!  STOP  !!!");
+      else             lcd.print("                "); // 16 spaces
+      break;
+  }
+}
+
+/* ================= LED CONTROL ================= */
+void setLeds(int z, bool stopBlinkOn) {
+  // More intuitive mapping:
+  // Green only in SAFE, yellows progressive in 1..3, red blinks in 4
+  digitalWrite(PIN_GREEN, z == 0);
+
+  digitalWrite(PIN_Y1,    z >= 1 && z <= 3);
+  digitalWrite(PIN_Y2,    z >= 2 && z <= 3);
+  digitalWrite(PIN_Y3,    z == 3);
+
+  // Zone 4 red blinking
+  if (z == 4) digitalWrite(PIN_RED, stopBlinkOn ? HIGH : LOW);
+  else        digitalWrite(PIN_RED, LOW);
+}
+
+/* ================= AUDIO (passive buzzer) ================= */
+unsigned long lastAudioMs = 0;
+int audioStep = 0;
+int lastZone = -1;
+
+void audioOff() {
+  noTone(PIN_BUZZER);
+  audioStep = 0;
+}
+
+void updateAudio(int z) {
+  unsigned long now = millis();
+
+  if (z != lastZone) {
+    lastZone = z;
+    audioStep = 0;
+    lastAudioMs = 0;
+    noTone(PIN_BUZZER);
+  }
+
+  if (z == 0) { audioOff(); return; }
+
+  // Zone 1: soft single beep
+  if (z == 1 && now - lastAudioMs > 800) {
+    lastAudioMs = now;
+    tone(PIN_BUZZER, 1200, 80);
+    return;
+  }
+
+  // Zone 2: double beep
+  if (z == 2) {
+    if (audioStep == 0) { tone(PIN_BUZZER, 1500, 70); lastAudioMs = now; audioStep = 1; }
+    else if (audioStep == 1 && now - lastAudioMs > 140) { audioStep = 2; }
+    else if (audioStep == 2) { tone(PIN_BUZZER, 1500, 70); lastAudioMs = now; audioStep = 3; }
+    else if (audioStep == 3 && now - lastAudioMs > 700) { audioStep = 0; }
+    return;
+  }
+
+  // Zone 3: urgency beeps
+  if (z == 3 && now - lastAudioMs > 220) {
+    lastAudioMs = now;
+    tone(PIN_BUZZER, 2200, 70);
+    return;
+  }
+
+  // Zone 4: siren sweep (continuous tone updated)
+  if (z == 4 && now - lastAudioMs > 40) {
+    lastAudioMs = now;
+    int sweep = audioStep++ % 140;
+    int f = (sweep < 70) ? 900 + sweep * 30 : 3000 - (sweep - 70) * 30;
+    tone(PIN_BUZZER, f);
+    return;
+  }
+}
+
+/* ================= STOP BLINK TIMER ================= */
+bool stopBlinkOn = true;
+unsigned long lastBlinkMs = 0;
+const unsigned long BLINK_PERIOD_MS = 250;
+
+void updateStopBlink(int z) {
+  if (z != 4) {
+    stopBlinkOn = true;
+    return;
+  }
+  unsigned long now = millis();
+  if (now - lastBlinkMs > BLINK_PERIOD_MS) {
+    lastBlinkMs = now;
+    stopBlinkOn = !stopBlinkOn;
+  }
+}
+
+/* ================= LIDAR READ (robust sync) ================= */
+void readLidar() {
+  while (lidar.available()) {
+    uint8_t b = lidar.read();
+    if (fidx == 0 && b != 0x59) continue;
+    if (fidx == 1 && b != 0x59) { fidx = 0; continue; }
+    frame[fidx++] = b;
+
+    if (fidx == 9) {
+      fidx = 0;
+      int d = frame[2] | (frame[3] << 8); // cm
+      if (d > 0 && d < 1200) {
+        distanceRaw = d;
+        lastGoodReadMs = millis();
+      }
+    }
+  }
+}
+
+/* ================= SIGNAL LOSS LOGIC ================= */
+const unsigned long SIGNAL_LOST_DELAY_MS = 1000; // only show NO SIGNAL after 1s
+bool sensorOk() {
+  return (millis() - lastGoodReadMs) < SIGNAL_LOST_DELAY_MS;
+}
+
+/* ================= SETUP ================= */
+void setup() {
+  Serial.begin(115200);
+  lidar.begin(115200);
+
+  pinMode(PIN_GREEN, OUTPUT);
+  pinMode(PIN_Y1, OUTPUT);
+  pinMode(PIN_Y2, OUTPUT);
+  pinMode(PIN_Y3, OUTPUT);
+  pinMode(PIN_RED, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+
+  lcd.begin(16, 2);
+  lcd.clear();
+
+  // Start screen (2s)
+  lcd.setCursor(0, 0);
+  lcd.print("PARKTRONIC");
+  lcd.setCursor(0, 1);
+  lcd.print("INITIALIZING...");
+  delay(2000);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("READY");
+  lcd.setCursor(0, 1);
+  lcd.print("WAITING DATA");
+  delay(600);
+
+  for (int i = 0; i < N; i++) dBuf[i] = 9999;
+  audioOff();
+}
+
+/* ================= LOOP ================= */
+void loop() {
+  readLidar();
+
+  bool ok = sensorOk();
+
+  // Throttle UI updates (prevents LCD spam)
+  static unsigned long lastUiMs = 0;
+  const unsigned long UI_PERIOD_MS = 120;
+  unsigned long now = millis();
+  bool doUi = (now - lastUiMs) >= UI_PERIOD_MS;
+  if (doUi) lastUiMs = now;
+
+  if (!ok) {
+    zone = 0;
+    updateStopBlink(zone);
+    setLeds(0, true);
+    audioOff();
+
+    if (doUi) {
+      lcdClearLine(0);
+      lcdClearLine(1);
+      lcd.setCursor(0, 0); lcd.print("DIST: --- cm");
+      lcd.setCursor(0, 1); lcd.print("NO SIGNAL       "); // <= 16 chars
+    }
+    return;
+  }
+
+  int dist = smoothDistance(distanceRaw);
+  zone = updateZone(zone, dist);
+
+  updateStopBlink(zone);
+
+  setLeds(zone, stopBlinkOn);
+  updateAudio(zone);
+
+  if (doUi) {
+    lcdPrintDistance(dist);
+    lcdPrintStatus(zone, stopBlinkOn);
+  }
+
+  // optional debug
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 250) {
+    lastPrint = millis();
+    Serial.print("Raw=");
+    Serial.print(distanceRaw);
+    Serial.print(" Smooth=");
+    Serial.print(dist);
+    Serial.print(" Zone=");
+    Serial.println(zone);
+  }
+}
