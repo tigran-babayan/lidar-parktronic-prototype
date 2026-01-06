@@ -33,6 +33,13 @@ This structure allows predictable and scalable system behavior.
 
 ---
 
+## Demo
+
+A short demo video demonstrating the system behavior:
+https://www.youtube.com/watch?v=4142PttMiW8
+
+---
+
 ## Hardware Components
 - Arduino Uno
 - TF-Luna LiDAR distance sensor
@@ -73,4 +80,4 @@ The project emphasizes system thinking and hands-on experimentation rather than 
 
 ## Author
 **Tigran Babayan**  
-Creative Technologist — Product & Hardware Prototyping  
+Creative Technologist — Product & Hardware Prototyping
